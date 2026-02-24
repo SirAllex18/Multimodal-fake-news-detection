@@ -1,0 +1,9 @@
+inherits: base.yaml
+
+training:
+  batch_size: 32
+
+evaluation:
+  checkpoint: "checkpoints/phase2/best.ckpt"
+  output_dir: "results"
+  threshold: 0.5

@@ -1,0 +1,12 @@
+inherits: base.yaml
+
+training:
+  freeze_encoders: false
+  unfreeze_top_n_layers: 4
+  encoder_lr: 5e-6
+  fusion_lr: 3e-5
+  head_lr: 5e-5
+  max_epochs: 15
+  batch_size: 8
+  grad_accum: 4
+  resume_from: "checkpoints/phase1/best.ckpt"
