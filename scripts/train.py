@@ -2,7 +2,10 @@ import argparse
 import os
 import sys
 
+import torch
 import pytorch_lightning as pl
+
+torch.set_float32_matmul_precision("high")
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
