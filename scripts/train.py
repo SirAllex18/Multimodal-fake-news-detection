@@ -92,16 +92,26 @@ def main():
     class_weights = compute_class_weights(train_dataset.annotations)
     model.loss_fn.set_type_class_weights(class_weights)
 
-    # Resume from checkpoint if specified
+    phase = "phase2" if not training_cfg.get("freeze_encoders", True) else "phase1"
+
+    # Resume from checkpoint if specified.
+    # For a new phase (different optimizer groups), load weights only and start fresh.
+    # For resuming the same phase, pass ckpt_path to Lightning for full state restore.
     ckpt_path = training_cfg.get("resume_from")
+    resume_full_state = training_cfg.get("resume_full_state", phase == "phase1")
     if ckpt_path and os.path.exists(ckpt_path):
-        print(f"Resuming from checkpoint: {ckpt_path}")
+        if resume_full_state:
+            print(f"Resuming full training state from: {ckpt_path}")
+        else:
+            print(f"Loading weights only from: {ckpt_path} (fresh optimizer/scheduler)")
+            import torch as _torch
+            ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(ckpt["state_dict"], strict=False)
+            ckpt_path = None
     else:
         if ckpt_path:
             print(f"Warning: checkpoint not found at {ckpt_path}, training from scratch")
         ckpt_path = None
-
-    phase = "phase2" if not training_cfg.get("freeze_encoders", True) else "phase1"
     checkpoint_dir = f"checkpoints/{phase}"
 
     callbacks = [

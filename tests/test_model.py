@@ -137,10 +137,12 @@ class TestCMCNet:
     @pytest.mark.slow
     def test_unfreeze_top_layers(self, config):
         """Test phase 2 unfreezing."""
+        # Test gradual_unfreeze=False (immediate unfreeze, legacy behavior)
         config_phase2 = dict(config)
         config_phase2["training"] = {
             "freeze_encoders": False,
             "unfreeze_top_n_layers": 4,
+            "gradual_unfreeze": False,
             "encoder_lr": 5e-6,
             "fusion_lr": 3e-5,
             "head_lr": 5e-5,
@@ -159,3 +161,23 @@ class TestCMCNet:
 
         assert text_trainable > 0, "Top text encoder layers should be unfrozen"
         assert image_trainable > 0, "Top image encoder layers should be unfrozen"
+
+        # Test gradual_unfreeze=True (default) — starts frozen at init
+        config_gradual = dict(config)
+        config_gradual["training"] = {
+            "freeze_encoders": False,
+            "unfreeze_top_n_layers": 4,
+            "encoder_lr": 5e-6,
+            "fusion_lr": 3e-5,
+            "head_lr": 5e-5,
+            "max_epochs": 15,
+            "batch_size": 8,
+        }
+
+        model_gradual = CMCNet(config_gradual)
+
+        text_trainable_gradual = sum(
+            p.numel() for p in model_gradual.text_encoder.parameters() if p.requires_grad
+        )
+        assert text_trainable_gradual == 0, "Gradual unfreeze should start with frozen encoders"
+        assert model_gradual._gradual_unfreeze is True

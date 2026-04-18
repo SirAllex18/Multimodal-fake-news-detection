@@ -146,6 +146,20 @@ class MultiTaskLoss(nn.Module):
             text_grounding_labels=batch["text_grounding_labels"],
         )
 
+        # Replace NaN/Inf in any sub-loss with 0 to prevent cascade
+        def _safe(x, name):
+            if torch.isfinite(x):
+                return x
+            import warnings
+            warnings.warn(f"NaN/Inf detected in {name} loss, replacing with 0")
+            return torch.zeros_like(x)
+
+        loss_binary = _safe(loss_binary, "binary")
+        loss_type = _safe(loss_type, "type")
+        loss_tg = _safe(loss_tg, "text_grounding")
+        loss_ig = _safe(loss_ig, "image_grounding")
+        loss_consist = _safe(loss_consist, "consistency")
+
         total = (
             self.lambda_binary * loss_binary
             + self.lambda_type * loss_type
