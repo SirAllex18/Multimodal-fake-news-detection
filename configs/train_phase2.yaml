@@ -9,4 +9,7 @@ training:
   max_epochs: 15
   batch_size: 4
   grad_accum: 8
-  resume_from: "checkpoints/phase1/best.ckpt"
+  # No Phase 1 resume: Phase 1 with frozen encoders overfits the heads on
+  # CLIP+DeBERTa features (AUROC ~0.54), producing a worse init than the
+  # pretrained priors. Train end-to-end with gradual unfreeze from step 0.
+  resume_from: null

@@ -64,7 +64,7 @@ class CMCNetCollator:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "binary_labels": torch.tensor(binary_labels, dtype=torch.long),
-            "type_labels": torch.tensor(type_labels, dtype=torch.long),
+            "type_labels": torch.tensor(type_labels, dtype=torch.float32),
             "text_grounding_labels": torch.stack(text_grounding_labels),
             "image_grounding_labels": torch.stack(image_grounding_labels),
             "has_text_grounding": torch.tensor(has_text_grounding, dtype=torch.bool),
@@ -124,21 +124,19 @@ class CMCNetCollator:
     def _build_image_grounding_labels(
         self, bbox: list | None, image_size: int = 224
     ) -> torch.Tensor:
-        """Build per-patch grounding labels using center-inside criterion."""
-        num_patches = self.patch_grid * self.patch_grid
-        labels = torch.zeros(num_patches)
+        """Build normalized xyxy bbox labels for image grounding."""
+        labels = torch.zeros(4)
 
         if bbox is None:
             return labels
 
         x1, y1, x2, y2 = bbox
-        patch_size = image_size / self.patch_grid
-
-        for row in range(self.patch_grid):
-            for col in range(self.patch_grid):
-                cx = (col + 0.5) * patch_size
-                cy = (row + 0.5) * patch_size
-                if x1 <= cx <= x2 and y1 <= cy <= y2:
-                    labels[row * self.patch_grid + col] = 1.0
+        labels[:] = torch.tensor([
+            x1 / image_size,
+            y1 / image_size,
+            x2 / image_size,
+            y2 / image_size,
+        ])
+        labels.clamp_(0.0, 1.0)
 
         return labels

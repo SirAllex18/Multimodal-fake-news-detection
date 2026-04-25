@@ -17,9 +17,11 @@ from src.metrics.evaluation import (
     binary_metrics,
     type_metrics,
     grounding_metrics,
+    bbox_iou_metrics,
     per_category_metrics,
     find_optimal_threshold,
 )
+from src.losses.multi_task_loss import bbox_from_logits
 
 
 def collect_predictions(model, loader, device):
@@ -31,7 +33,7 @@ def collect_predictions(model, loader, device):
     all_text_ground_labels = []
     all_text_ground_probs = []
     all_image_ground_labels = []
-    all_image_ground_probs = []
+    all_image_ground_preds = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -45,7 +47,7 @@ def collect_predictions(model, loader, device):
             all_binary_probs.extend(binary_probs.cpu().tolist())
 
             # Type
-            type_preds = outputs["type_logits"].argmax(dim=-1)
+            type_preds = (torch.sigmoid(outputs["type_logits"]) >= 0.5).long()
             all_type_labels.extend(batch["type_labels"].cpu().tolist())
             all_type_preds.extend(type_preds.cpu().tolist())
 
@@ -65,13 +67,11 @@ def collect_predictions(model, loader, device):
             # Image grounding
             has_ig = batch["has_image_grounding"]
             if has_ig.any():
-                ig_logits = outputs["image_ground_logits"][has_ig]
+                ig_boxes = bbox_from_logits(outputs["image_ground_logits"][has_ig])
                 ig_labels = batch["image_grounding_labels"][has_ig]
-                for j in range(ig_logits.shape[0]):
+                for j in range(ig_boxes.shape[0]):
                     all_image_ground_labels.append(ig_labels[j].cpu().numpy())
-                    all_image_ground_probs.append(
-                        torch.sigmoid(ig_logits[j]).cpu().numpy()
-                    )
+                    all_image_ground_preds.append(ig_boxes[j].cpu().numpy())
 
             if (batch_idx + 1) % 100 == 0:
                 print(f"  Processed {batch_idx + 1} batches")
@@ -84,7 +84,7 @@ def collect_predictions(model, loader, device):
         "text_ground_labels": all_text_ground_labels,
         "text_ground_probs": all_text_ground_probs,
         "image_ground_labels": all_image_ground_labels,
-        "image_ground_probs": all_image_ground_probs,
+        "image_ground_preds": all_image_ground_preds,
     }
 
 
@@ -115,8 +115,13 @@ def main():
         pin_memory=False,
     )
 
-    # Load model
-    model = CMCNet.load_from_checkpoint(checkpoint_path, config=config)
+    # Load model. Manual load so we can pre-register the type_pos_weights buffer
+    # that training registers dynamically via set_type_pos_weights.
+    model = CMCNet(config)
+    num_classes = config["model"]["num_classes"]
+    model.loss_fn.set_type_pos_weights(torch.ones(num_classes))
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["state_dict"])
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -163,8 +168,8 @@ def main():
     results["text_grounding"] = grounding_metrics(
         test_preds["text_ground_labels"], test_preds["text_ground_probs"]
     )
-    results["image_grounding"] = grounding_metrics(
-        test_preds["image_ground_labels"], test_preds["image_ground_probs"]
+    results["image_grounding"] = bbox_iou_metrics(
+        test_preds["image_ground_preds"], test_preds["image_ground_labels"]
     )
 
     fake_cls_list = [test_dataset.annotations[i]["fake_cls"] for i in range(len(test_dataset))]
@@ -187,7 +192,7 @@ def main():
         print(f"  {k}: {v:.4f}")
 
     print("\n=== Type Classification ===")
-    print(f"  accuracy: {results['type']['accuracy']:.4f}")
+    print(f"  exact_match_accuracy: {results['type']['exact_match_accuracy']:.4f}")
     print(f"  macro_f1: {results['type']['macro_f1']:.4f}")
 
     print("\n=== Text Grounding ===")

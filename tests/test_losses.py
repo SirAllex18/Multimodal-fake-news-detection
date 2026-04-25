@@ -4,7 +4,8 @@ import torch
 from src.losses.multi_task_loss import (
     focal_bce_with_logits,
     dice_loss,
-    consistency_reg,
+    bbox_from_logits,
+    generalized_box_iou,
     MultiTaskLoss,
 )
 
@@ -59,29 +60,28 @@ class TestDiceLoss:
         assert loss.item() < 0.1
 
 
-class TestConsistencyReg:
-    def test_returns_zero_no_mixed(self):
-        """No mixed samples -> loss is 0."""
-        binary = torch.randn(4, 2)
-        img_ground = torch.randn(4, 196)
-        txt_ground = torch.randn(4, 128)
-        has_img = torch.tensor([True, True, False, False])
-        has_txt = torch.tensor([False, False, True, True])
+class TestBoxLossHelpers:
+    def test_bbox_from_logits_valid_boxes(self):
+        logits = torch.randn(8, 4)
+        boxes = bbox_from_logits(logits)
+        assert boxes.shape == (8, 4)
+        assert torch.all(boxes >= 0.0)
+        assert torch.all(boxes <= 1.0)
+        assert torch.all(boxes[:, 2] >= boxes[:, 0])
+        assert torch.all(boxes[:, 3] >= boxes[:, 1])
 
-        loss = consistency_reg(binary, img_ground, txt_ground, has_img, has_txt)
-        assert loss.item() == 0.0
+    def test_bbox_from_logits_uses_cxcywh(self):
+        logits = torch.zeros(1, 4)
+        boxes = bbox_from_logits(logits)
+        torch.testing.assert_close(
+            boxes,
+            torch.tensor([[0.25, 0.25, 0.75, 0.75]]),
+        )
 
-    def test_returns_nonzero_with_mixed(self):
-        """Mixed samples should produce some loss."""
-        binary = torch.tensor([[0.0, 5.0], [0.0, 5.0], [0.0, -5.0], [0.0, -5.0]])
-        img_ground = torch.randn(4, 196) * 0.01  # Low grounding signal
-        txt_ground = torch.randn(4, 128) * 0.01
-        has_img = torch.tensor([True, True, False, False])
-        has_txt = torch.tensor([True, False, True, False])
-
-        loss = consistency_reg(binary, img_ground, txt_ground, has_img, has_txt)
-        # First sample is mixed with high det_conf and low grounding
-        assert loss.item() > 0.0
+    def test_generalized_box_iou_identity(self):
+        boxes = torch.tensor([[0.1, 0.1, 0.5, 0.5]])
+        giou = generalized_box_iou(boxes, boxes)
+        torch.testing.assert_close(giou, torch.ones(1, 1))
 
 
 class TestMultiTaskLoss:
@@ -92,10 +92,15 @@ class TestMultiTaskLoss:
             "lambda_type": 0.3,
             "lambda_text_grounding": 0.5,
             "lambda_image_grounding": 0.5,
-            "lambda_consistency": 0.1,
+            "lambda_alignment": 0.1,
+            "lambda_itm": 0.2,
+            "lambda_consistency": 0.0,
+            "contrastive_temp": 0.07,
             "focal_gamma": 2.0,
             "focal_alpha": 0.75,
             "dice_weight": 0.3,
+            "bbox_l1_weight": 5.0,
+            "bbox_giou_weight": 2.0,
         }
         return MultiTaskLoss(config)
 
@@ -103,15 +108,15 @@ class TestMultiTaskLoss:
         """All-orig batch should produce no NaN."""
         outputs = {
             "binary_logits": torch.randn(4, 2),
-            "type_logits": torch.randn(4, 9),
+            "type_logits": torch.randn(4, 4),
             "text_ground_logits": torch.randn(4, 128),
-            "image_ground_logits": torch.randn(4, 196),
+            "image_ground_logits": torch.randn(4, 4),
         }
         batch = {
             "binary_labels": torch.zeros(4, dtype=torch.long),
-            "type_labels": torch.zeros(4, dtype=torch.long),
+            "type_labels": torch.zeros(4, 4),
             "text_grounding_labels": torch.full((4, 128), -100.0),
-            "image_grounding_labels": torch.zeros(4, 196),
+            "image_grounding_labels": torch.zeros(4, 4),
             "has_text_grounding": torch.tensor([False, False, False, False]),
             "has_image_grounding": torch.tensor([False, False, False, False]),
         }
@@ -120,14 +125,16 @@ class TestMultiTaskLoss:
         assert not torch.isnan(losses["total"])
         assert losses["text_grounding"].item() == 0.0
         assert losses["image_grounding"].item() == 0.0
+        assert losses["alignment"].item() == 0.0
+        assert losses["itm"].item() == 0.0
 
     def test_grounding_mask(self, loss_fn):
         """Grounding losses only computed for relevant samples."""
         outputs = {
             "binary_logits": torch.randn(4, 2),
-            "type_logits": torch.randn(4, 9),
+            "type_logits": torch.randn(4, 4),
             "text_ground_logits": torch.randn(4, 128),
-            "image_ground_logits": torch.randn(4, 196),
+            "image_ground_logits": torch.randn(4, 4),
         }
 
         tg_labels = torch.full((4, 128), -100.0)
@@ -135,13 +142,18 @@ class TestMultiTaskLoss:
         tg_labels[1, 1:10] = 0.0
         tg_labels[1, 3] = 1.0
 
-        ig_labels = torch.zeros(4, 196)
+        ig_labels = torch.zeros(4, 4)
         # Only sample 2 has image grounding
-        ig_labels[2, 10:20] = 1.0
+        ig_labels[2] = torch.tensor([0.1, 0.1, 0.5, 0.5])
 
         batch = {
             "binary_labels": torch.tensor([0, 1, 1, 0]),
-            "type_labels": torch.tensor([0, 3, 1, 0]),
+            "type_labels": torch.tensor([
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ]),
             "text_grounding_labels": tg_labels,
             "image_grounding_labels": ig_labels,
             "has_text_grounding": torch.tensor([False, True, False, False]),
@@ -153,20 +165,107 @@ class TestMultiTaskLoss:
         assert losses["text_grounding"].item() > 0.0
         assert losses["image_grounding"].item() > 0.0
 
+    def test_stage_b_losses_use_orig_pairs_only(self, loss_fn):
+        outputs = {
+            "binary_logits": torch.randn(4, 2),
+            "type_logits": torch.randn(4, 4),
+            "text_ground_logits": torch.randn(4, 128),
+            "image_ground_logits": torch.randn(4, 4),
+            "text_proj": torch.nn.functional.normalize(torch.randn(4, 256), dim=-1),
+            "image_proj": torch.nn.functional.normalize(torch.randn(4, 256), dim=-1),
+            "itm_pos_logits": torch.randn(1, 2),
+            "itm_neg_logits": torch.randn(2, 2),
+        }
+        batch = {
+            "binary_labels": torch.tensor([0, 1, 1, 1]),
+            "type_labels": torch.tensor([
+                [0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+            ]),
+            "text_grounding_labels": torch.full((4, 128), -100.0),
+            "image_grounding_labels": torch.zeros(4, 4),
+            "has_text_grounding": torch.tensor([False, False, False, False]),
+            "has_image_grounding": torch.tensor([False, False, False, False]),
+        }
+
+        losses = loss_fn(outputs, batch)
+        assert losses["alignment"].item() > 0.0
+        assert losses["itm"].item() > 0.0
+
+    def test_stage_b_queue_logits_path(self, loss_fn):
+        outputs = {
+            "binary_logits": torch.randn(2, 2),
+            "type_logits": torch.randn(2, 4),
+            "text_ground_logits": torch.randn(2, 128),
+            "image_ground_logits": torch.randn(2, 4),
+            "alignment_logits_t2i": torch.randn(2, 6),
+            "alignment_logits_i2t": torch.randn(2, 6),
+            "alignment_targets": torch.tensor([0, 1]),
+            "itm_logits": torch.randn(4, 2),
+            "itm_labels": torch.tensor([1, 1, 0, 0]),
+        }
+        batch = {
+            "binary_labels": torch.tensor([0, 0]),
+            "type_labels": torch.zeros(2, 4),
+            "text_grounding_labels": torch.full((2, 128), -100.0),
+            "image_grounding_labels": torch.zeros(2, 4),
+            "has_text_grounding": torch.tensor([False, False]),
+            "has_image_grounding": torch.tensor([False, False]),
+        }
+
+        losses = loss_fn(outputs, batch)
+        assert losses["alignment"].item() > 0.0
+        assert losses["itm"].item() > 0.0
+
+    def test_stage_b_losses_skip_all_fake_batch(self, loss_fn):
+        outputs = {
+            "binary_logits": torch.randn(3, 2),
+            "type_logits": torch.randn(3, 4),
+            "text_ground_logits": torch.randn(3, 128),
+            "image_ground_logits": torch.randn(3, 4),
+            "text_proj": torch.nn.functional.normalize(torch.randn(3, 256), dim=-1),
+            "image_proj": torch.nn.functional.normalize(torch.randn(3, 256), dim=-1),
+        }
+        batch = {
+            "binary_labels": torch.tensor([1, 1, 1]),
+            "type_labels": torch.tensor([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+            ]),
+            "text_grounding_labels": torch.full((3, 128), -100.0),
+            "image_grounding_labels": torch.zeros(3, 4),
+            "has_text_grounding": torch.tensor([False, False, False]),
+            "has_image_grounding": torch.tensor([False, False, False]),
+        }
+
+        losses = loss_fn(outputs, batch)
+        assert losses["alignment"].item() == 0.0
+        assert losses["itm"].item() == 0.0
+
     def test_gradient_flow(self, loss_fn):
         """Verify gradients flow through the loss."""
         logits = torch.randn(2, 2, requires_grad=True)
         outputs = {
             "binary_logits": logits,
-            "type_logits": torch.randn(2, 9, requires_grad=True),
+            "type_logits": torch.randn(2, 4, requires_grad=True),
             "text_ground_logits": torch.randn(2, 128, requires_grad=True),
-            "image_ground_logits": torch.randn(2, 196, requires_grad=True),
+            "image_ground_logits": torch.randn(2, 4, requires_grad=True),
+            "text_proj": torch.nn.functional.normalize(torch.randn(2, 256, requires_grad=True), dim=-1),
+            "image_proj": torch.nn.functional.normalize(torch.randn(2, 256, requires_grad=True), dim=-1),
+            "itm_pos_logits": torch.randn(1, 2, requires_grad=True),
+            "itm_neg_logits": torch.randn(2, 2, requires_grad=True),
         }
         batch = {
             "binary_labels": torch.tensor([0, 1]),
-            "type_labels": torch.tensor([0, 1]),
+            "type_labels": torch.tensor([[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]),
             "text_grounding_labels": torch.zeros(2, 128),
-            "image_grounding_labels": torch.zeros(2, 196),
+            "image_grounding_labels": torch.tensor([
+                [0.0, 0.0, 0.0, 0.0],
+                [0.1, 0.1, 0.5, 0.5],
+            ]),
             "has_text_grounding": torch.tensor([False, True]),
             "has_image_grounding": torch.tensor([False, True]),
         }

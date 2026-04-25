@@ -2,7 +2,7 @@ inherits: base.yaml
 
 training:
   freeze_encoders: true
-  lr: 1.0e-4
+  lr: 5.0e-5
   max_epochs: 10
   batch_size: 8
   grad_accum: 4

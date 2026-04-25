@@ -17,7 +17,12 @@ model:
   num_cross_attn_heads: 8
   cross_attn_ffn_dim: 3072
   cross_attn_dropout: 0.1
-  num_classes: 9
+  projection_dim: 256
+  projection_dropout: 0.1
+  momentum: 0.995
+  queue_size: 4096
+  itm_start_epoch: 1
+  num_classes: 4
   num_patches: 196
   num_patches_with_cls: 197
   patch_grid: 14
@@ -27,11 +32,16 @@ loss:
   lambda_type: 0.3
   lambda_text_grounding: 0.5
   lambda_image_grounding: 0.5
-  lambda_consistency: 0.1
+  lambda_alignment: 0.1
+  lambda_itm: 0.2
+  lambda_consistency: 0.0
   use_class_weights: true
+  contrastive_temp: 0.07
   focal_gamma: 2.0
   focal_alpha: 0.75
   dice_weight: 0.3
+  bbox_l1_weight: 5.0
+  bbox_giou_weight: 2.0
 
 training:
   precision: "bf16-mixed"
@@ -39,9 +49,13 @@ training:
   seed: 42
 
 sampling:
-  use_balanced_sampler: true
+  # Train is ~50/50 binary natively; no sampling needed for binary balance.
+  # WeightedRandomSampler caused coverage issues (image_only seen 0.56x/epoch,
+  # text_only 1.7x) and a distribution mismatch with val/test (34/66 binary).
+  # Type imbalance is handled by class-weighted CE in the loss, not sampling.
+  use_balanced_sampler: false
   group_weights:
     orig: 1.0
-    image_only: 1.5
-    text_only: 2.5
-    mixed: 3.0
+    image_only: 1.0
+    text_only: 1.0
+    mixed: 1.0

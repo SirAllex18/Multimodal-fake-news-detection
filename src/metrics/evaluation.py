@@ -26,14 +26,40 @@ def binary_metrics(labels, probs, threshold=0.5):
 
 
 def type_metrics(labels, preds, num_classes=9):
-    """Compute type classification metrics."""
+    """Compute multi-label manipulation type metrics."""
     result = {
-        "accuracy": accuracy_score(labels, preds),
+        "exact_match_accuracy": accuracy_score(labels, preds),
         "macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
-        "per_class_f1": f1_score(labels, preds, average=None, zero_division=0).tolist(),
-        "confusion_matrix": confusion_matrix(labels, preds, labels=list(range(num_classes))).tolist(),
+        "micro_f1": f1_score(labels, preds, average="micro", zero_division=0),
+        "per_label_f1": f1_score(labels, preds, average=None, zero_division=0).tolist(),
     }
     return result
+
+
+def bbox_iou_metrics(pred_boxes, target_boxes):
+    """Compute bbox IoU metrics for image grounding."""
+    if len(pred_boxes) == 0:
+        return {"mean_iou": 0.0, "median_iou": 0.0, "iou_at_0.5": 0.0}
+
+    pred = np.asarray(pred_boxes, dtype=np.float32)
+    target = np.asarray(target_boxes, dtype=np.float32)
+
+    x1 = np.maximum(pred[:, 0], target[:, 0])
+    y1 = np.maximum(pred[:, 1], target[:, 1])
+    x2 = np.minimum(pred[:, 2], target[:, 2])
+    y2 = np.minimum(pred[:, 3], target[:, 3])
+    inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+
+    area_pred = np.maximum(0.0, pred[:, 2] - pred[:, 0]) * np.maximum(0.0, pred[:, 3] - pred[:, 1])
+    area_target = np.maximum(0.0, target[:, 2] - target[:, 0]) * np.maximum(0.0, target[:, 3] - target[:, 1])
+    union = area_pred + area_target - inter
+    ious = inter / np.maximum(union, 1e-6)
+
+    return {
+        "mean_iou": float(np.mean(ious)),
+        "median_iou": float(np.median(ious)),
+        "iou_at_0.5": float(np.mean(ious >= 0.5)),
+    }
 
 
 def grounding_metrics(all_labels, all_probs, threshold=0.5):

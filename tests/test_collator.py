@@ -173,33 +173,32 @@ class TestTextGroundingLabels:
 
 
 class TestImageGroundingLabels:
-    def test_patch_grid_basic(self, collator):
-        """Known bbox covers specific patches."""
+    def test_bbox_normalization_basic(self, collator):
+        """Known bbox is normalized to [0, 1] xyxy coordinates."""
         # Bbox covering top-left 32x32 pixels = 2x2 patches at 14x14 grid (16px patches)
         bbox = [0, 0, 32, 32]
         labels = collator._build_image_grounding_labels(bbox)
-        assert labels.shape == (196,)
-        # Center-inside: patch centers at (8, 8), (24, 8), (8, 24), (24, 24)
-        # All within [0,32] x [0,32]
-        assert labels[0] == 1.0  # (row=0, col=0) center=(8,8)
-        assert labels[1] == 1.0  # (row=0, col=1) center=(24,8)
-        assert labels[14] == 1.0  # (row=1, col=0) center=(8,24)
-        assert labels[15] == 1.0  # (row=1, col=1) center=(24,24)
+        assert labels.shape == (4,)
+        torch.testing.assert_close(
+            labels,
+            torch.tensor([0.0, 0.0, 32 / 224, 32 / 224]),
+        )
 
-    def test_patch_grid_spanning(self, collator):
+    def test_bbox_normalization_spanning(self, collator):
         """Bbox spanning a larger area."""
         bbox = [50, 50, 150, 150]
         labels = collator._build_image_grounding_labels(bbox)
-        assert labels.shape == (196,)
-        positive_count = labels.sum().item()
-        assert positive_count > 0
+        assert labels.shape == (4,)
+        assert torch.all(labels >= 0.0)
+        assert torch.all(labels <= 1.0)
         # Should cover roughly (100/224 * 14)^2 ≈ 6x6 = 36 patches
-        assert positive_count > 10
+        assert labels[2] > labels[0]
+        assert labels[3] > labels[1]
 
-    def test_patch_grid_none(self, collator):
+    def test_bbox_none(self, collator):
         """No bbox -> all zeros."""
         labels = collator._build_image_grounding_labels(None)
-        assert labels.shape == (196,)
+        assert labels.shape == (4,)
         assert labels.sum().item() == 0.0
 
 
@@ -218,16 +217,21 @@ class TestBatchCollation:
         assert batch["input_ids"].shape == (4, 128)
         assert batch["attention_mask"].shape == (4, 128)
         assert batch["binary_labels"].shape == (4,)
-        assert batch["type_labels"].shape == (4,)
+        assert batch["type_labels"].shape == (4, 4)
         assert batch["text_grounding_labels"].shape == (4, 128)
-        assert batch["image_grounding_labels"].shape == (4, 196)
+        assert batch["image_grounding_labels"].shape == (4, 4)
         assert batch["has_text_grounding"].shape == (4,)
         assert batch["has_image_grounding"].shape == (4,)
 
         # Check dtypes
         assert batch["binary_labels"].dtype == torch.long
-        assert batch["type_labels"].dtype == torch.long
+        assert batch["type_labels"].dtype == torch.float32
         assert batch["text_grounding_labels"].dtype == torch.float32
         assert batch["image_grounding_labels"].dtype == torch.float32
         assert batch["has_text_grounding"].dtype == torch.bool
         assert batch["has_image_grounding"].dtype == torch.bool
+
+        torch.testing.assert_close(
+            batch["type_labels"][0],
+            torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        )

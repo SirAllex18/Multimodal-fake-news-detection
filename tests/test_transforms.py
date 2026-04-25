@@ -28,11 +28,14 @@ class TestDGM4Transform:
         bbox = [50, 50, 200, 300]
         img_out, bbox_out = val_transform(image, bbox)
         assert img_out.shape == (3, 224, 224)
-        # Bbox should be transformed (may be None if cropped out)
         if bbox_out is not None:
             assert len(bbox_out) == 4
             assert bbox_out[2] > bbox_out[0]  # width > 0
             assert bbox_out[3] > bbox_out[1]  # height > 0
+            assert bbox_out[0] == pytest.approx(56.0, abs=1.0)
+            assert bbox_out[1] == pytest.approx(28.0, abs=1.0)
+            assert bbox_out[2] == pytest.approx(140.0, abs=1.0)
+            assert bbox_out[3] == pytest.approx(168.0, abs=1.0)
 
     def test_bbox_within_bounds(self, val_transform):
         """Transformed bbox should be within image bounds."""
@@ -46,46 +49,43 @@ class TestDGM4Transform:
             assert bbox_out[3] <= 224
 
     def test_bbox_tracking_through_flip(self):
-        """Verify bbox is correctly tracked through horizontal flip."""
-        # Use val transform (no random flip) to get deterministic behavior
+        """Verify bbox is correctly tracked through square-image resize."""
         transform = DGM4Transform(image_size=224, is_train=False)
-        image = self._make_image(256, 256)  # Square to avoid resize distortion
+        image = self._make_image(256, 256)
         bbox = [10, 10, 50, 50]
         img_out, bbox_out = transform(image, bbox)
-        # Center crop on 256x256 -> 224x224 removes 16px from each side
-        # bbox should shift by -16 in both x and y
         if bbox_out is not None:
-            assert bbox_out[0] >= 0
-            assert bbox_out[1] >= 0
+            scale = 224 / 256
+            assert bbox_out[0] == pytest.approx(10 * scale, abs=1.0)
+            assert bbox_out[1] == pytest.approx(10 * scale, abs=1.0)
+            assert bbox_out[2] == pytest.approx(50 * scale, abs=1.0)
+            assert bbox_out[3] == pytest.approx(50 * scale, abs=1.0)
 
-    def test_degenerate_bbox_crop(self):
-        """Bbox outside crop area should return None."""
-        # Use val transform with a bbox in the far corner
+    def test_small_corner_bbox_survives_letterbox(self):
+        """Small corner bboxes should survive letterbox preprocessing."""
         transform = DGM4Transform(image_size=224, is_train=False)
         image = self._make_image(400, 400)
-        # Bbox in top-left corner, far from center crop area
         bbox = [0, 0, 5, 5]
         img_out, bbox_out = transform(image, bbox)
-        # After resize to 256x256, bbox becomes very small
-        # Center crop removes 16px from each side
-        # Bbox may survive but be very small, or become degenerate
         assert img_out.shape == (3, 224, 224)
+        assert bbox_out is not None
+        assert bbox_out[2] > bbox_out[0]
+        assert bbox_out[3] > bbox_out[1]
 
     def test_train_transform_augments(self, train_transform):
-        """Train transform should apply random augmentation."""
-        # Use a gradient image so random crop produces different means
+        """Train transform should still apply stochastic augmentation."""
         import numpy as np
         arr = np.zeros((400, 300, 3), dtype=np.uint8)
-        for i in range(400):
-            arr[i, :, :] = int(255 * i / 400)
+        for j in range(300):
+            arr[:, j, :] = int(255 * j / 300)
         image = Image.fromarray(arr)
         bbox = [50, 50, 200, 300]
 
-        # Run multiple times - should get different results
         results = []
         for _ in range(20):
             img_out, bbox_out = train_transform(image, bbox)
-            results.append(round(img_out.mean().item(), 4))
+            left_mean = img_out[:, :, :112].mean().item()
+            right_mean = img_out[:, :, 112:].mean().item()
+            results.append(round(left_mean - right_mean, 4))
 
-        # With random crop + flip on gradient image, results should vary
         assert len(set(results)) > 1, "Train transform should produce varied outputs"

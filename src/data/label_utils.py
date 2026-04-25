@@ -16,13 +16,26 @@ FAKE_CLS_LIST = [
 
 FAKE_CLS_TO_IDX = {name: i for i, name in enumerate(FAKE_CLS_LIST)}
 
+MANIPULATION_TYPES = [
+    "face_swap",
+    "face_attribute",
+    "text_swap",
+    "text_attribute",
+]
+
 
 def get_binary_label(fake_cls: str) -> int:
     return 0 if fake_cls == "orig" else 1
 
 
-def get_type_label(fake_cls: str) -> int:
-    return FAKE_CLS_TO_IDX[fake_cls]
+def get_type_label(fake_cls: str) -> list[float]:
+    """Return DGM4's 4-label manipulation target: FS, FA, TS, TA."""
+    return [
+        float("face_swap" in fake_cls),
+        float("face_attribute" in fake_cls),
+        float("text_swap" in fake_cls),
+        float("text_attribute" in fake_cls),
+    ]
 
 
 def has_image_manipulation(fake_cls: str) -> bool:
@@ -49,3 +62,14 @@ def compute_class_weights(annotations: List[dict]) -> torch.Tensor:
     # Normalize so weights sum to num_classes
     weights = weights * (num_classes / weights.sum())
     return weights
+
+
+def compute_type_pos_weights(annotations: List[dict]) -> torch.Tensor:
+    """Compute BCE positive weights for the 4-label manipulation target."""
+    positives = torch.zeros(len(MANIPULATION_TYPES))
+    for ann in annotations:
+        positives += torch.tensor(get_type_label(ann["fake_cls"]), dtype=torch.float32)
+
+    total = float(len(annotations))
+    negatives = total - positives
+    return negatives / positives.clamp(min=1.0)

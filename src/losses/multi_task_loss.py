@@ -38,39 +38,43 @@ def dice_loss(
     return 1.0 - dice
 
 
-def consistency_reg(
-    binary_logits: torch.Tensor,
-    img_ground_logits: torch.Tensor,
-    txt_ground_logits: torch.Tensor,
-    has_img: torch.Tensor,
-    has_txt: torch.Tensor,
-    text_grounding_labels: torch.Tensor = None,
-) -> torch.Tensor:
-    """Encourage grounding signals to align with detection confidence for mixed samples."""
-    mixed = has_img & has_txt
-    if not mixed.any():
-        return torch.tensor(0.0, device=binary_logits.device, requires_grad=False)
+def bbox_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Convert raw cxcywh logits to valid normalized xyxy boxes."""
+    coords = torch.sigmoid(logits)
+    cx, cy, w, h = coords.unbind(dim=-1)
+    half_w = 0.5 * w
+    half_h = 0.5 * h
+    x1 = (cx - half_w).clamp(0.0, 1.0)
+    y1 = (cy - half_h).clamp(0.0, 1.0)
+    x2 = (cx + half_w).clamp(0.0, 1.0)
+    y2 = (cy + half_h).clamp(0.0, 1.0)
+    return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    det_conf = torch.sigmoid(binary_logits[mixed, 1])
-    img_max_prob = torch.sigmoid(img_ground_logits[mixed]).max(dim=-1).values
 
-    # For text: mask out special/padding tokens (labeled -100) to avoid
-    # spurious peaks from pad positions
-    txt_logits_mixed = txt_ground_logits[mixed]  # (N_mixed, 128)
-    if text_grounding_labels is not None:
-        txt_labels_mixed = text_grounding_labels[mixed]  # (N_mixed, 128)
-        valid_mask = (txt_labels_mixed != -100.0)  # True for content tokens
-        # Replace invalid positions with large negative so sigmoid -> ~0
-        txt_logits_masked = txt_logits_mixed.masked_fill(~valid_mask, -1e9)
-    else:
-        txt_logits_masked = txt_logits_mixed
+def box_area(boxes: torch.Tensor) -> torch.Tensor:
+    wh = (boxes[:, 2:] - boxes[:, :2]).clamp(min=0.0)
+    return wh[:, 0] * wh[:, 1]
 
-    txt_max_prob = torch.sigmoid(txt_logits_masked).max(dim=-1).values
 
-    loss_img = (det_conf * (1.0 - img_max_prob)).mean()
-    loss_txt = (det_conf * (1.0 - txt_max_prob)).mean()
+def generalized_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Pairwise generalized IoU for normalized xyxy boxes."""
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
 
-    return loss_img + loss_txt
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0.0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+
+    union = area1[:, None] + area2 - inter
+    iou = inter / union.clamp(min=1e-6)
+
+    enc_lt = torch.minimum(boxes1[:, None, :2], boxes2[:, :2])
+    enc_rb = torch.maximum(boxes1[:, None, 2:], boxes2[:, 2:])
+    enc_wh = (enc_rb - enc_lt).clamp(min=0.0)
+    enc_area = enc_wh[:, :, 0] * enc_wh[:, :, 1]
+
+    return iou - (enc_area - union) / enc_area.clamp(min=1e-6)
 
 
 class MultiTaskLoss(nn.Module):
@@ -80,19 +84,31 @@ class MultiTaskLoss(nn.Module):
         self.lambda_type = config.get("lambda_type", 0.3)
         self.lambda_text_grounding = config.get("lambda_text_grounding", 0.5)
         self.lambda_image_grounding = config.get("lambda_image_grounding", 0.5)
-        self.lambda_consistency = config.get("lambda_consistency", 0.1)
+        self.lambda_alignment = config.get("lambda_alignment", 0.05)
+        self.lambda_itm = config.get("lambda_itm", 0.2)
+        self.lambda_consistency = config.get("lambda_consistency", 0.0)
 
         self.focal_gamma = config.get("focal_gamma", 2.0)
         self.focal_alpha = config.get("focal_alpha", 0.75)
+        self.contrastive_temp = config.get("contrastive_temp", 0.07)
 
         self.dice_weight = config.get("dice_weight", 0.3)
         self.bce_weight = 1.0 - self.dice_weight
+        self.bbox_l1_weight = config.get("bbox_l1_weight", 5.0)
+        self.bbox_giou_weight = config.get("bbox_giou_weight", 2.0)
 
-        self.type_class_weights = None
+        self.type_pos_weights = None
+
+    def set_type_pos_weights(self, weights: torch.Tensor):
+        if "_type_pos_weights" in self._buffers:
+            self._buffers["_type_pos_weights"] = weights
+        else:
+            self.register_buffer("_type_pos_weights", weights)
+        self.type_pos_weights = weights
 
     def set_type_class_weights(self, weights: torch.Tensor):
-        self.register_buffer("_type_weights", weights)
-        self.type_class_weights = weights
+        # Backward-compatible alias for older training/eval scripts.
+        self.set_type_pos_weights(weights)
 
     def forward(self, outputs: dict, batch: dict) -> dict:
         device = outputs["binary_logits"].device
@@ -102,14 +118,14 @@ class MultiTaskLoss(nn.Module):
             outputs["binary_logits"], batch["binary_labels"]
         )
 
-        # Type classification loss
-        type_weights = self.type_class_weights
-        if type_weights is not None:
-            type_weights = type_weights.to(device)
-        loss_type = F.cross_entropy(
+        # 4-label manipulation type loss
+        type_pos_weights = self.type_pos_weights
+        if type_pos_weights is not None:
+            type_pos_weights = type_pos_weights.to(device)
+        loss_type = F.binary_cross_entropy_with_logits(
             outputs["type_logits"],
             batch["type_labels"],
-            weight=type_weights,
+            pos_weight=type_pos_weights,
         )
 
         # Text grounding loss (focal BCE, masked)
@@ -126,46 +142,74 @@ class MultiTaskLoss(nn.Module):
             )
             loss_tg = (raw * valid.float()).sum() / valid.float().sum().clamp(min=1.0)
 
-        # Image grounding loss (BCE + Dice, masked)
+        # Image grounding loss (bbox L1 + GIoU, masked)
         loss_ig = torch.tensor(0.0, device=device)
         has_ig = batch["has_image_grounding"]
         if has_ig.any():
-            ig_logits = outputs["image_ground_logits"][has_ig]
-            ig_labels = batch["image_grounding_labels"][has_ig]
+            pred_boxes = bbox_from_logits(outputs["image_ground_logits"][has_ig])
+            target_boxes = batch["image_grounding_labels"][has_ig]
 
-            bce_ig = F.binary_cross_entropy_with_logits(ig_logits, ig_labels)
-            dice_ig = dice_loss(ig_logits, ig_labels)
-            loss_ig = self.bce_weight * bce_ig + self.dice_weight * dice_ig
+            l1_ig = F.l1_loss(pred_boxes, target_boxes)
+            giou = generalized_box_iou(pred_boxes, target_boxes).diagonal()
+            giou_ig = (1.0 - giou).mean()
+            loss_ig = self.bbox_l1_weight * l1_ig + self.bbox_giou_weight * giou_ig
 
-        # Consistency regularizer
-        loss_consist = consistency_reg(
-            outputs["binary_logits"],
-            outputs["image_ground_logits"],
-            outputs["text_ground_logits"],
-            has_ig, has_tg,
-            text_grounding_labels=batch["text_grounding_labels"],
-        )
+        # Image-text alignment loss over pristine/original pairs only
+        loss_alignment = torch.tensor(0.0, device=device)
+        align_logits_t2i = outputs.get("alignment_logits_t2i")
+        align_logits_i2t = outputs.get("alignment_logits_i2t")
+        align_targets = outputs.get("alignment_targets")
+        if (
+            align_logits_t2i is not None
+            and align_logits_i2t is not None
+            and align_targets is not None
+        ):
+            logits_t2i = align_logits_t2i / self.contrastive_temp
+            logits_i2t = align_logits_i2t / self.contrastive_temp
+            loss_alignment = 0.5 * (
+                F.cross_entropy(logits_t2i, align_targets.to(device))
+                + F.cross_entropy(logits_i2t, align_targets.to(device))
+            )
+        else:
+            text_proj = outputs.get("text_proj")
+            image_proj = outputs.get("image_proj")
+            orig_mask = batch["binary_labels"] == 0
+            if text_proj is not None and image_proj is not None and orig_mask.any():
+                orig_indices = orig_mask.nonzero(as_tuple=False).squeeze(-1).to(device=device)
+                logits_t2i = text_proj[orig_indices] @ image_proj.transpose(0, 1)
+                logits_i2t = image_proj[orig_indices] @ text_proj.transpose(0, 1)
+                logits_t2i = logits_t2i / self.contrastive_temp
+                logits_i2t = logits_i2t / self.contrastive_temp
+                loss_alignment = 0.5 * (
+                    F.cross_entropy(logits_t2i, orig_indices)
+                    + F.cross_entropy(logits_i2t, orig_indices)
+                )
 
-        # Replace NaN/Inf in any sub-loss with 0 to prevent cascade
-        def _safe(x, name):
-            if torch.isfinite(x):
-                return x
-            import warnings
-            warnings.warn(f"NaN/Inf detected in {name} loss, replacing with 0")
-            return torch.zeros_like(x)
+        # Image-text matching over pristine matched pairs versus mismatched pairs
+        loss_itm = torch.tensor(0.0, device=device)
+        itm_logits = outputs.get("itm_logits")
+        itm_labels = outputs.get("itm_labels")
+        if itm_logits is None or itm_labels is None:
+            itm_pos_logits = outputs.get("itm_pos_logits")
+            itm_neg_logits = outputs.get("itm_neg_logits")
+            if itm_pos_logits is not None and itm_neg_logits is not None:
+                itm_logits = torch.cat([itm_pos_logits, itm_neg_logits], dim=0)
+                itm_labels = torch.cat([
+                    torch.ones(itm_pos_logits.shape[0], dtype=torch.long, device=device),
+                    torch.zeros(itm_neg_logits.shape[0], dtype=torch.long, device=device),
+                ], dim=0)
+        if itm_logits is not None and itm_labels is not None:
+            loss_itm = F.cross_entropy(itm_logits, itm_labels)
 
-        loss_binary = _safe(loss_binary, "binary")
-        loss_type = _safe(loss_type, "type")
-        loss_tg = _safe(loss_tg, "text_grounding")
-        loss_ig = _safe(loss_ig, "image_grounding")
-        loss_consist = _safe(loss_consist, "consistency")
+        loss_consist = torch.tensor(0.0, device=device)
 
         total = (
             self.lambda_binary * loss_binary
             + self.lambda_type * loss_type
             + self.lambda_text_grounding * loss_tg
             + self.lambda_image_grounding * loss_ig
-            + self.lambda_consistency * loss_consist
+            + self.lambda_alignment * loss_alignment
+            + self.lambda_itm * loss_itm
         )
 
         return {
@@ -174,5 +218,7 @@ class MultiTaskLoss(nn.Module):
             "type": loss_type.detach(),
             "text_grounding": loss_tg.detach() if isinstance(loss_tg, torch.Tensor) else torch.tensor(0.0),
             "image_grounding": loss_ig.detach() if isinstance(loss_ig, torch.Tensor) else torch.tensor(0.0),
+            "alignment": loss_alignment.detach(),
+            "itm": loss_itm.detach(),
             "consistency": loss_consist.detach(),
         }

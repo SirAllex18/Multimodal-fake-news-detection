@@ -1,0 +1,63 @@
+config:
+  data:
+    dataset_root: ./DGM4
+    train_json: metadata/train.json
+    val_json: metadata/val.json
+    test_json: metadata/test.json
+    max_text_length: 128
+    image_size: 224
+    num_workers: 4
+    pin_memory: true
+  model:
+    text_encoder_name: microsoft/deberta-v3-base
+    image_encoder_name: ViT-B-16
+    image_encoder_pretrained: openai
+    hidden_dim: 768
+    num_cross_attn_layers: 2
+    num_cross_attn_heads: 8
+    cross_attn_ffn_dim: 3072
+    cross_attn_dropout: 0.1
+    projection_dim: 256
+    projection_dropout: 0.1
+    momentum: 0.995
+    queue_size: 4096
+    itm_start_epoch: 1
+    num_classes: 4
+    num_patches: 196
+    num_patches_with_cls: 197
+    patch_grid: 14
+  loss:
+    lambda_binary: 1.0
+    lambda_type: 0.3
+    lambda_text_grounding: 0.5
+    lambda_image_grounding: 0.5
+    lambda_alignment: 0.1
+    lambda_itm: 0.2
+    lambda_consistency: 0.0
+    use_class_weights: true
+    contrastive_temp: 0.07
+    focal_gamma: 2.0
+    focal_alpha: 0.75
+    dice_weight: 0.3
+    bbox_l1_weight: 5.0
+    bbox_giou_weight: 2.0
+  training:
+    precision: bf16-mixed
+    gradient_clip_val: 1.0
+    seed: 42
+    freeze_encoders: false
+    unfreeze_top_n_layers: 4
+    encoder_lr: 1.0e-06
+    fusion_lr: 1.0e-05
+    head_lr: 3.0e-05
+    max_epochs: 15
+    batch_size: 4
+    grad_accum: 8
+    resume_from: null
+  sampling:
+    use_balanced_sampler: false
+    group_weights:
+      orig: 1.0
+      image_only: 1.0
+      text_only: 1.0
+      mixed: 1.0

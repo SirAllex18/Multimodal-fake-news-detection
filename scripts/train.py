@@ -20,7 +20,7 @@ from src.utils.config import load_config
 from src.data.dgm4_dataset import DGM4Dataset
 from src.data.collator import CMCNetCollator
 from src.data.samplers import create_balanced_sampler
-from src.data.label_utils import compute_class_weights
+from src.data.label_utils import compute_type_pos_weights
 from src.model.cmc_net import CMCNet
 
 
@@ -88,9 +88,9 @@ def main():
     # Model
     model = CMCNet(config)
 
-    # Set class weights for type loss
-    class_weights = compute_class_weights(train_dataset.annotations)
-    model.loss_fn.set_type_class_weights(class_weights)
+    # Set positive weights for 4-label manipulation BCE loss
+    type_pos_weights = compute_type_pos_weights(train_dataset.annotations)
+    model.loss_fn.set_type_pos_weights(type_pos_weights)
 
     phase = "phase2" if not training_cfg.get("freeze_encoders", True) else "phase1"
 
@@ -117,14 +117,30 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath=checkpoint_dir,
-            filename="best",
-            monitor="val/binary_f1",
+            filename="best_auroc",
+            monitor="val/binary_auroc",
             mode="max",
             save_top_k=1,
             save_last=True,
         ),
-        EarlyStopping(
+        ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="best_f1",
             monitor="val/binary_f1",
+            mode="max",
+            save_top_k=1,
+            save_last=False,
+        ),
+        ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="best_image_iou",
+            monitor="val/image_grounding_iou",
+            mode="max",
+            save_top_k=1,
+            save_last=False,
+        ),
+        EarlyStopping(
+            monitor="val/binary_auroc",
             mode="max",
             patience=5,
         ),

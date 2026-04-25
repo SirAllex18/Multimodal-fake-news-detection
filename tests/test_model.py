@@ -4,7 +4,14 @@ import torch
 from src.model.text_encoder import TextEncoder
 from src.model.image_encoder import ImageEncoder
 from src.model.cross_attention import BidirectionalCrossAttention
-from src.model.heads import BinaryHead, TypeHead, TextGroundingHead, ImageGroundingHead
+from src.model.heads import (
+    BinaryHead,
+    ProjectionHead,
+    TypeHead,
+    TextGroundingHead,
+    ITMHead,
+    ImageGroundingHead,
+)
 from src.model.cmc_net import CMCNet
 
 
@@ -20,7 +27,12 @@ def config():
             "num_cross_attn_heads": 8,
             "cross_attn_ffn_dim": 3072,
             "cross_attn_dropout": 0.1,
-            "num_classes": 9,
+            "num_classes": 4,
+            "projection_dim": 256,
+            "projection_dropout": 0.1,
+            "momentum": 0.995,
+            "queue_size": 32,
+            "itm_start_epoch": 1,
             "num_patches": 196,
             "num_patches_with_cls": 197,
             "patch_grid": 14,
@@ -30,10 +42,15 @@ def config():
             "lambda_type": 0.3,
             "lambda_text_grounding": 0.5,
             "lambda_image_grounding": 0.5,
-            "lambda_consistency": 0.1,
+            "lambda_alignment": 0.1,
+            "lambda_itm": 0.2,
+            "lambda_consistency": 0.0,
+            "contrastive_temp": 0.07,
             "focal_gamma": 2.0,
             "focal_alpha": 0.75,
             "dice_weight": 0.3,
+            "bbox_l1_weight": 5.0,
+            "bbox_giou_weight": 2.0,
         },
         "training": {
             "freeze_encoders": True,
@@ -64,16 +81,22 @@ class TestCrossAttention:
 
 class TestHeads:
     def test_binary_head(self):
-        head = BinaryHead(1536)
-        x = torch.randn(4, 1536)
+        head = BinaryHead(1537)
+        x = torch.randn(4, 1537)
         out = head(x)
         assert out.shape == (4, 2)
 
+    def test_projection_head(self):
+        head = ProjectionHead(768, 256)
+        x = torch.randn(4, 768)
+        out = head(x)
+        assert out.shape == (4, 256)
+
     def test_type_head(self):
-        head = TypeHead(1536, 9)
+        head = TypeHead(1536, 4)
         x = torch.randn(4, 1536)
         out = head(x)
-        assert out.shape == (4, 9)
+        assert out.shape == (4, 4)
 
     def test_text_grounding_head(self):
         head = TextGroundingHead(768)
@@ -81,11 +104,17 @@ class TestHeads:
         out = head(x)
         assert out.shape == (4, 128)
 
+    def test_itm_head(self):
+        head = ITMHead(1536)
+        x = torch.randn(4, 1536)
+        out = head(x)
+        assert out.shape == (4, 2)
+
     def test_image_grounding_head(self):
         head = ImageGroundingHead(768)
         x = torch.randn(4, 196, 768)
         out = head(x)
-        assert out.shape == (4, 196)
+        assert out.shape == (4, 4)
 
 
 class TestCMCNet:
@@ -96,24 +125,37 @@ class TestCMCNet:
         model.eval()
 
         batch = {
-            "images": torch.randn(2, 3, 224, 224),
-            "input_ids": torch.randint(0, 1000, (2, 128)),
-            "attention_mask": torch.ones(2, 128, dtype=torch.long),
-            "binary_labels": torch.tensor([0, 1]),
-            "type_labels": torch.tensor([0, 1]),
-            "text_grounding_labels": torch.zeros(2, 128),
-            "image_grounding_labels": torch.zeros(2, 196),
-            "has_text_grounding": torch.tensor([False, True]),
-            "has_image_grounding": torch.tensor([False, True]),
+            "images": torch.randn(3, 3, 224, 224),
+            "input_ids": torch.randint(0, 1000, (3, 128)),
+            "attention_mask": torch.ones(3, 128, dtype=torch.long),
+            "binary_labels": torch.tensor([0, 0, 1]),
+            "type_labels": torch.tensor([
+                [0., 0., 0., 0.],
+                [0., 0., 0., 0.],
+                [1., 0., 0., 0.],
+            ]),
+            "text_grounding_labels": torch.zeros(3, 128),
+            "image_grounding_labels": torch.zeros(3, 4),
+            "has_text_grounding": torch.tensor([False, False, True]),
+            "has_image_grounding": torch.tensor([False, False, True]),
         }
 
         with torch.no_grad():
             outputs = model(batch)
 
-        assert outputs["binary_logits"].shape == (2, 2)
-        assert outputs["type_logits"].shape == (2, 9)
-        assert outputs["text_ground_logits"].shape == (2, 128)
-        assert outputs["image_ground_logits"].shape == (2, 196)
+        assert outputs["binary_logits"].shape == (3, 2)
+        assert outputs["type_logits"].shape == (3, 4)
+        assert outputs["text_ground_logits"].shape == (3, 128)
+        assert outputs["text_proj"].shape == (3, 256)
+        assert outputs["image_proj"].shape == (3, 256)
+        assert outputs["alignment_logits_t2i"].shape == (2, 2)
+        assert outputs["alignment_logits_i2t"].shape == (2, 2)
+        assert outputs["alignment_targets"].shape == (2,)
+        assert outputs["itm_logits"].shape == (4, 2)
+        assert outputs["itm_labels"].shape == (4,)
+        assert outputs["queue_text_proj"].shape == (2, 256)
+        assert outputs["queue_image_proj"].shape == (2, 256)
+        assert outputs["image_ground_logits"].shape == (3, 4)
 
     @pytest.mark.slow
     def test_freeze_param_counts(self, config):
